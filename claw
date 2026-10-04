@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# Provision and manage an OpenClaw gateway on a Hetzner Cloud VPS.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KNOWN_HOSTS="$ROOT/.known_hosts"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+log() { printf '\n==> %s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+Usage: ./claw <command>
+
+  up                 Create the server (if missing) and install/refresh OpenClaw
+  deploy             Re-run the install on the existing server (config changes)
+  update             Pull the latest OpenClaw image and restart the gateway
+  status             Show server and container status
+  logs               Follow gateway logs
+  ssh [cmd...]       Open a shell on the server, or run a command
+  tunnel             Forward the dashboard to http://127.0.0.1:18789
+  token              Print the gateway token (for the dashboard login)
+  cli <args...>      Run an openclaw CLI command on the server
+  pairing            List pending Telegram pairing requests
+  approve <code>     Approve a Telegram pairing code
+  destroy            Delete the server and its firewall
+
+Configuration lives in .env (see .env.example).
+EOF
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  help | -h | --help)
+    usage
+    exit 0
+    ;;
+esac
+
+[[ -f "$ROOT/.env" ]] || die "missing $ROOT/.env (copy .env.example and fill it in)"
+set -a
+# shellcheck disable=SC1091
+. "$ROOT/.env"
+set +a
+
+SERVER_NAME="${SERVER_NAME:-openclaw}"
+SERVER_TYPE="${SERVER_TYPE:-cx23}"
+SERVER_LOCATION="${SERVER_LOCATION:-hel1}"
+SERVER_IMAGE="${SERVER_IMAGE:-ubuntu-24.04}"
+ADMIN_USER="${ADMIN_USER:-claw}"
+OPENCLAW_IMAGE="${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}"
+OPENCLAW_TZ="${OPENCLAW_TZ:-UTC}"
+SSH_PUBLIC_KEY_FILE="${SSH_PUBLIC_KEY_FILE:-$HOME/.ssh/id_ed25519.pub}"
+SSH_PUBLIC_KEY_FILE="${SSH_PUBLIC_KEY_FILE/#\~/$HOME}"
+FIREWALL_NAME="$SERVER_NAME-fw"
+
+need() {
+  local cmd
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null || die "'$cmd' is not installed"
+  done
+}
+
+server_exists() { hcloud server describe "$SERVER_NAME" >/dev/null 2>&1; }
+
+server_ip() {
+  hcloud server ip "$SERVER_NAME" 2>/dev/null || die "server '$SERVER_NAME' not found (run ./claw up)"
+}
+
+SSH_OPTS=(-o "UserKnownHostsFile=$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30)
+
+target() { printf '%s@%s' "$ADMIN_USER" "$(server_ip)"; }
+
+remote() { ssh "${SSH_OPTS[@]}" "$(target)" "$@"; }
+
+# Runs inside the gateway container: a separate CLI container has its own PID
+# namespace, sees the gateway's state lock as stale and removes it, which
+# breaks the running gateway. Local args are quoted to survive the remote shell.
+remote_cli() {
+  local args
+  args="$(printf '%q ' "$@")"
+  ssh -t "${SSH_OPTS[@]}" "$(target)" "cd ~/openclaw && docker compose exec openclaw-gateway node dist/index.js $args"
+}
+
+ensure_ssh_key() {
+  [[ -f "$SSH_PUBLIC_KEY_FILE" ]] || die "no public key at $SSH_PUBLIC_KEY_FILE (set SSH_PUBLIC_KEY_FILE in .env, or create one with: ssh-keygen -t ed25519)"
+  local fingerprint
+  fingerprint="$(ssh-keygen -E md5 -lf "$SSH_PUBLIC_KEY_FILE" | awk '{print $2}' | sed 's/^MD5://')"
+  # Hetzner rejects duplicate keys, so reuse one that is already uploaded.
+  SSH_KEY_ID="$(hcloud ssh-key list -o json | jq -r --arg fp "$fingerprint" '.[] | select(.fingerprint == $fp) | .id' | head -n1)"
+  if [[ -z "$SSH_KEY_ID" ]]; then
+    log "Uploading SSH key"
+    hcloud ssh-key create --name "$SERVER_NAME-$(hostname)" --public-key-from-file "$SSH_PUBLIC_KEY_FILE"
+    SSH_KEY_ID="$(hcloud ssh-key list -o json | jq -r --arg fp "$fingerprint" '.[] | select(.fingerprint == $fp) | .id' | head -n1)"
+  fi
+}
+
+ensure_firewall() {
+  hcloud firewall describe "$FIREWALL_NAME" >/dev/null 2>&1 && return
+  log "Creating firewall $FIREWALL_NAME (inbound: SSH and ping only)"
+  local rules
+  rules="$(mktemp)"
+  cat >"$rules" <<'EOF'
+[
+  {"direction": "in", "protocol": "tcp", "port": "22", "source_ips": ["0.0.0.0/0", "::/0"]},
+  {"direction": "in", "protocol": "icmp", "source_ips": ["0.0.0.0/0", "::/0"]}
+]
+EOF
+  hcloud firewall create --name "$FIREWALL_NAME" --rules-file "$rules"
+  rm -f "$rules"
+}
+
+# No secrets go in here: user data stays readable from the metadata service
+# by anything running on the server.
+write_cloud_init() {
+  cat >"$1" <<EOF
+#cloud-config
+groups:
+  - docker
+users:
+  - name: $ADMIN_USER
+    uid: 1000
+    groups: [sudo, docker]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - $(cat "$SSH_PUBLIC_KEY_FILE")
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+write_files:
+  - path: /etc/ssh/sshd_config.d/00-hardening.conf
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      AllowTcpForwarding local
+      X11Forwarding no
+      AllowUsers $ADMIN_USER
+runcmd:
+  - sshd -t && systemctl restart ssh
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow OpenSSH
+  - ufw --force enable
+  - systemctl enable --now fail2ban
+  - curl -fsSL https://get.docker.com | sh
+EOF
+}
+
+create_server() {
+  hcloud server-type describe "$SERVER_TYPE" >/dev/null 2>&1 \
+    || die "unknown server type '$SERVER_TYPE' (see: hcloud server-type list)"
+  ensure_ssh_key
+  ensure_firewall
+
+  log "Creating server $SERVER_NAME ($SERVER_TYPE, $SERVER_IMAGE, $SERVER_LOCATION)"
+  local user_data
+  user_data="$(mktemp)"
+  write_cloud_init "$user_data"
+  hcloud server create \
+    --name "$SERVER_NAME" \
+    --type "$SERVER_TYPE" \
+    --image "$SERVER_IMAGE" \
+    --location "$SERVER_LOCATION" \
+    --ssh-key "$SSH_KEY_ID" \
+    --firewall "$FIREWALL_NAME" \
+    --user-data-from-file "$user_data"
+  rm -f "$user_data"
+  # A recycled IP may still have a stale host key recorded.
+  rm -f "$KNOWN_HOSTS"
+}
+
+wait_for_server() {
+  log "Waiting for SSH"
+  local i
+  for i in $(seq 1 60); do
+    if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 -o BatchMode=yes "$(target)" true 2>/dev/null; then
+      break
+    fi
+    [[ "$i" -lt 60 ]] || die "SSH did not come up on $(server_ip)"
+    sleep 5
+  done
+
+  log "Waiting for cloud-init to finish (packages, Docker, hardening)"
+  local rc=0
+  remote 'cloud-init status --wait' || rc=$?
+  # 2 means finished with recoverable warnings.
+  [[ "$rc" -eq 0 || "$rc" -eq 2 ]] \
+    || die "cloud-init failed; inspect with: ./claw ssh sudo cat /var/log/cloud-init-output.log"
+  remote 'docker --version' >/dev/null || die "Docker is not installed on the server"
+}
+
+deploy() {
+  [[ -n "${DEEPSEEK_API_KEY:-}" ]] || die "DEEPSEEK_API_KEY is not set in .env"
+  [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || die "TELEGRAM_BOT_TOKEN is not set in .env"
+
+  log "Uploading files"
+  remote 'mkdir -p ~/openclaw'
+  scp -q "${SSH_OPTS[@]}" "$ROOT/remote/compose.yml" "$ROOT/remote/install.sh" "$(target):openclaw/"
+  # Secrets go over stdin so they never touch local temp files or argv.
+  remote 'umask 077 && cat > ~/openclaw/secrets.env' <<EOF
+OPENCLAW_IMAGE=$OPENCLAW_IMAGE
+OPENCLAW_TZ=$OPENCLAW_TZ
+DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY
+TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+EOF
+
+  remote 'bash ~/openclaw/install.sh'
+
+  cat <<EOF
+
+OpenClaw is running on $(server_ip).
+
+Next steps:
+  1. Message your bot in Telegram; it replies with a pairing code.
+  2. ./claw approve <code>
+  3. Dashboard: ./claw tunnel, open http://127.0.0.1:18789, log in with ./claw token
+EOF
+}
+
+need hcloud jq ssh scp ssh-keygen
+[[ -n "${HCLOUD_TOKEN:-}" ]] || die "HCLOUD_TOKEN is not set in .env"
+
+case "$cmd" in
+  up)
+    if server_exists; then
+      log "Server $SERVER_NAME already exists at $(server_ip)"
+    else
+      create_server
+    fi
+    wait_for_server
+    deploy
+    ;;
+  deploy)
+    deploy
+    ;;
+  update)
+    remote 'cd ~/openclaw && docker compose pull openclaw-gateway && docker compose up -d openclaw-gateway && docker image prune -f'
+    ;;
+  status)
+    hcloud server describe "$SERVER_NAME" -o format='{{.Name}}  {{.Status}}  {{.PublicNet.IPv4.IP}}  {{.ServerType.Name}}  {{.Datacenter.Location.Name}}'
+    remote 'cd ~/openclaw && docker compose ps'
+    ;;
+  logs)
+    remote 'cd ~/openclaw && docker compose logs -f --tail 100 openclaw-gateway'
+    ;;
+  ssh)
+    if [[ $# -eq 0 ]]; then
+      remote
+    elif [[ $# -eq 1 ]]; then
+      remote "$1"
+    else
+      remote "$(printf '%q ' "$@")"
+    fi
+    ;;
+  tunnel)
+    echo "Dashboard: http://127.0.0.1:18789 (Ctrl-C to close)"
+    ssh "${SSH_OPTS[@]}" -N -L 18789:127.0.0.1:18789 "$(target)"
+    ;;
+  token)
+    remote "grep '^OPENCLAW_GATEWAY_TOKEN=' ~/openclaw/.env | cut -d= -f2-"
+    ;;
+  cli)
+    remote_cli "$@"
+    ;;
+  pairing)
+    remote_cli pairing list telegram
+    ;;
+  approve)
+    [[ $# -eq 1 ]] || die "usage: ./claw approve <code>"
+    remote_cli pairing approve telegram "$1"
+    ;;
+  destroy)
+    server_exists || die "server '$SERVER_NAME' not found"
+    echo "This permanently deletes server '$SERVER_NAME' ($(server_ip)) and all OpenClaw data on it."
+    read -r -p "Type the server name to confirm: " answer
+    [[ "$answer" == "$SERVER_NAME" ]] || die "aborted"
+    hcloud server delete "$SERVER_NAME"
+    hcloud firewall delete "$FIREWALL_NAME" || true
+    rm -f "$KNOWN_HOSTS"
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac

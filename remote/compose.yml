@@ -1,0 +1,45 @@
+# Trimmed from upstream openclaw/docker-compose.yml: prebuilt image only, and
+# the gateway port is published on the VPS loopback so it is reachable only
+# through an SSH tunnel (Docker-published ports bypass ufw otherwise).
+x-openclaw: &openclaw
+  image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+  env_file:
+    - .env
+  cap_drop:
+    - NET_RAW
+    - NET_ADMIN
+  security_opt:
+    - no-new-privileges:true
+  init: true
+  volumes:
+    - "${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw"
+    - "${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace"
+    - "${OPENCLAW_AUTH_PROFILE_SECRET_DIR}:/home/node/.config/openclaw"
+
+x-openclaw-env: &openclaw-env
+  HOME: /home/node
+  OPENCLAW_HOME: /home/node
+  TERM: xterm-256color
+  # Container-side paths; the host paths in .env are only bind-mount sources.
+  OPENCLAW_STATE_DIR: /home/node/.openclaw
+  OPENCLAW_CONFIG_PATH: /home/node/.openclaw/openclaw.json
+  OPENCLAW_CONFIG_DIR: /home/node/.openclaw
+  OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+  OPENCLAW_GATEWAY_PORT: "18789"
+  TZ: ${OPENCLAW_TZ:-UTC}
+
+services:
+  openclaw-gateway:
+    <<: *openclaw
+    environment:
+      <<: *openclaw-env
+    ports:
+      - "127.0.0.1:18789:18789"
+    restart: unless-stopped
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
+    healthcheck:
+      test: ["CMD", "node", "dist/docker-healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
