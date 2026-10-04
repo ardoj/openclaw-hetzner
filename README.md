@@ -82,12 +82,16 @@ Open `http://127.0.0.1:18789` and log in with the token.
 
 ### Changing the model
 
-Onboarding selects `deepseek/deepseek-v4-pro`. To switch, for example to the
-cheaper flash model:
+Onboarding selects `deepseek/deepseek-v4-pro`. To switch to the cheaper flash
+model:
 
 ```bash
-./claw cli config set agents.defaults.model.primary deepseek/deepseek-v4-flash
+./claw cli models list --all --provider deepseek   # see what is available
+./claw cli models set deepseek/deepseek-flash
 ```
+
+Use `models set`, not `config set agents.defaults.model.primary ...`: the
+latter rejects models that are in the catalog but not yet configured.
 
 ## Configuration
 
